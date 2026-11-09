@@ -19,11 +19,16 @@ interface ApiSearchItem {
 const M3U8_PATTERN = /(https?:\/\/[^"'\s]+?\.m3u8)/g;
 
 /** 封装带超时的 fetch，区分超时和网络错误 */
-async function fetchWithTimeout(url: string, options: RequestInit, timeout = 30000): Promise<Response> {
+async function fetchWithTimeout<T>(
+  url: string, options: RequestInit, read: (response: Response) => Promise<T>, timeout = 10000
+): Promise<T> {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), timeout);
   try {
-    return await fetch(url, { ...options, signal: controller.signal });
+    const response = await fetch(url, { ...options, signal: controller.signal });
+    if (!response.ok) throw new Error(`请求失败: HTTP ${response.status}`);
+    // Keep the deadline active until the response body has finished downloading.
+    return await read(response);
   } catch (error: unknown) {
     // 区分超时错误和网络错误
     const err = error as Error;
@@ -57,8 +62,10 @@ function parseEpisodes(vod_play_url?: string, fallbackContent?: string): { episo
       const currentTitles: string[] = [];
 
       source.split('#').forEach((entry) => {
-        const [title, url] = entry.split('$');
-        if (url?.endsWith('.m3u8')) {
+        const separator = entry.indexOf('$');
+        const title = separator >= 0 ? entry.slice(0, separator) : '';
+        const url = (separator >= 0 ? entry.slice(separator + 1) : entry).trim();
+        if (/^https?:\/\/[^\s]+\.m3u8(?:[?#].*)?$/i.test(url)) {
           currentTitles.push(title);
           currentEpisodes.push(url);
         }
@@ -112,10 +119,7 @@ export async function* searchFromApiStream(
 ): AsyncGenerator<SearchResult[], void, unknown> {
   const apiUrl = apiSite.api + API_CONFIG.search.path + encodeURIComponent(query);
 
-  const response = await fetchWithTimeout(apiUrl, { headers: API_CONFIG.search.headers }, timeout);
-  if (!response.ok) return;
-
-  const data = await response.json();
+  const data = await fetchWithTimeout(apiUrl, { headers: API_CONFIG.search.headers }, response => response.json(), timeout);
   if (!Array.isArray(data?.list)) return;
 
   // 第一页
@@ -140,10 +144,7 @@ export async function* searchFromApiStream(
             .replace('{page}', page.toString());
 
         const promise = (async () => {
-          const pageRes = await fetchWithTimeout(pageUrl, { headers: API_CONFIG.search.headers }, timeout);
-          if (!pageRes.ok) return null;
-
-          const pageData = await pageRes.json();
+          const pageData = await fetchWithTimeout(pageUrl, { headers: API_CONFIG.search.headers }, response => response.json(), timeout);
           if (!Array.isArray(pageData?.list)) return null;
 
           const results = pageData.list.map((item: ApiSearchItem) =>
@@ -152,7 +153,8 @@ export async function* searchFromApiStream(
           return { page, results };
         })();
 
-        pagePromises.push(promise);
+        // A failed later page must not discard successful pages.
+        pagePromises.push(promise.catch(() => null));
       }
 
       const settled = await Promise.all(pagePromises);
@@ -170,10 +172,7 @@ export async function* searchFromApiStream(
             .replace('{query}', encodeURIComponent(query))
             .replace('{page}', page.toString());
 
-        const pageRes = await fetchWithTimeout(pageUrl, { headers: API_CONFIG.search.headers }, timeout);
-        if (!pageRes.ok) continue;
-
-        const pageData = await pageRes.json();
+        const pageData = await fetchWithTimeout(pageUrl, { headers: API_CONFIG.search.headers }, response => response.json(), timeout).catch(() => null);
         if (Array.isArray(pageData?.list)) {
           const results = pageData.list.map((item: ApiSearchItem) =>
             mapItemToResult(item, apiSite, apiSite.name)
@@ -191,11 +190,7 @@ export async function getDetailFromApi(apiSite: ApiSite, id: string): Promise<Se
   if (apiSite.detail) return handleSpecialSourceDetail(id, apiSite);
 
   const detailUrl = `${apiSite.api}${API_CONFIG.detail.path}${id}`;
-  const response = await fetchWithTimeout(detailUrl, { headers: API_CONFIG.detail.headers });
-
-  if (!response.ok) throw new Error(`详情请求失败: ${response.status}`);
-
-  const data = await response.json();
+  const data = await fetchWithTimeout(detailUrl, { headers: API_CONFIG.detail.headers }, response => response.json());
   if (!Array.isArray(data?.list) || data.list.length === 0) {
     throw new Error('获取到的详情内容无效');
   }
@@ -222,11 +217,7 @@ export async function getDetailFromApi(apiSite: ApiSite, id: string): Promise<Se
 /** 特殊站点详情处理 */
 async function handleSpecialSourceDetail(id: string, apiSite: ApiSite): Promise<SearchResult> {
   const detailUrl = `${apiSite.detail}/index.php/vod/detail/id/${id}.html`;
-  const response = await fetchWithTimeout(detailUrl, { headers: API_CONFIG.detail.headers });
-
-  if (!response.ok) throw new Error(`详情页请求失败: ${response.status}`);
-
-  const html = await response.text();
+  const html = await fetchWithTimeout(detailUrl, { headers: API_CONFIG.detail.headers }, response => response.text());
 
   // 特定站点规则（优先）
   let matches: string[] = [];
