@@ -742,7 +742,7 @@ export function usePlayEngine() {
                         ? (searchType === 'tv' && r.episodes.length > 1) ||
                           (searchType === 'movie' && r.episodes.length === 1)
                         : true;
-                      return titleMatch && yearMatch && typeMatch;
+                      return titleMatch && yearMatch && typeMatch && r.episodes.length > 0;
                     });
 
                   if (filteredResults.length > 0) {
@@ -772,8 +772,10 @@ export function usePlayEngine() {
         return aggregatedResults;
       } catch (err) {
         setSourceSearchError(err instanceof Error ? err.message : '搜索失败');
-        setAvailableSources([]);
-        return [];
+        // Keep sources already received if another source or the stream fails.
+        return aggregatedResults;
+      } finally {
+        setSourceSearchLoading(false);
       }
     };
 
@@ -843,6 +845,14 @@ export function usePlayEngine() {
 
       await fetchSourcesData(videoTitle, (newResults) => {
         allResults = [...allResults, ...newResults];
+
+        // Start as soon as a playable match arrives; keep collecting alternatives.
+        if (!hasInitialized && !currentSource && !currentId &&
+            !enablePreferBestSourceFromStorage && newResults.length > 0) {
+          detailData = newResults[0];
+          initDetail(detailData);
+          hasInitialized = true;
+        }
 
         // 如果还没确定 detailData，就尝试找目标源
         if (!detailData && currentSource && currentId) {
